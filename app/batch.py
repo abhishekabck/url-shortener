@@ -5,29 +5,34 @@ from fastapi import Depends
 from app.database import SessionLocal
 import asyncio
 
-update_query = lambda counts:(update(URL)
+update_query = lambda counts: (
+    update(URL)
     .where(URL.short_code.in_(counts.keys()))
     .values(
-        click_count=URL.click_count + case(
+        click_count=case(
             counts,
             value=URL.short_code,
-            else_=0
+            else_=URL.click_count  # keep existing if not in batch
         )
     )
 )
-def update_fallback(counts):
-    bulk_update(counts)
+
+
+def chunked_dict(d, size):
+    items = list(d.items())
+    for i in range(0, len(items), size):
+        yield dict(items[i:i+size])
 
 def update_counts_in_db(db):
     counts = get_all_cached_click_counts()
-    if counts:
-        query = update_query(counts)
+    if not counts:
+        return
+    for chunk in chunked_dict(counts, 200):
         try:
-            db.execute(query)
+            db.execute(update_query(chunk))
             db.commit()
         except Exception as e:
-            print("Bulk update failed..")
-            update_fallback(counts)
+            print(f"Batch chunk failed: {e}")
 
 
 async def click_count_increment_batch():

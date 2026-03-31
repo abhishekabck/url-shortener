@@ -1,5 +1,7 @@
 import redis
 import os
+from sqlalchemy import select
+from app.models import URL
 
 redis_client = redis.from_url(os.getenv("REDIS_URL") + "/0")
 redis_client_counts = redis.from_url(os.getenv("REDIS_URL") + "/1")
@@ -36,7 +38,7 @@ def get_all_cached_click_counts() -> list[list[str, int]]:
     keys = redis_client_counts.keys("clicks:*")
     for key in keys:
         short_code = key.decode("utf-8").replace("clicks:", "")
-        count = redis_client_counts.getdel(key)
+        count = redis_client_counts.get(key)
         if count:
                 count = int(count.decode('utf-8'))
                 counts[short_code] = count
@@ -46,4 +48,9 @@ def get_all_cached_click_counts() -> list[list[str, int]]:
 def bulk_update(counts):
     for key in counts:
         redis_client_counts.incr(f"clicks:{key}", counts[key])
-        
+
+def warm_redis_from_db(db):
+    urls = db.query(URL.short_code, URL.click_count).all()
+    for short_code, click_count in urls:
+        key = f"clicks:{short_code}"
+        redis_client_counts.setnx(key, click_count)

@@ -2,9 +2,10 @@ from fastapi import FastAPI, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import OperationalError
-from app.database import get_db, Base, engine
+from app.database import get_db, Base, engine, SessionLocal
 from app.schemas import URLCreate, URLResponse, URLStats
 from app import crud
+from app.cache import warm_redis_from_db
 import os
 import time
 from app.batch import click_count_increment_batch
@@ -15,6 +16,11 @@ import asyncio
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    db = SessionLocal()
+    try:
+        warm_redis_from_db(db)
+    finally:
+        db.close()
     task = asyncio.create_task(click_count_increment_batch())
     yield
     task.cancel()

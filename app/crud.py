@@ -45,6 +45,6 @@ def get_url_stats(db, short_code):
     return URLStats(
         short_code=obj.short_code,
         original_url=obj.original_url,
-        click_count=obj.click_count + get_cached_click_count(short_code),
+        click_count=get_cached_click_count(short_code),
         created_at=obj.created_at
     )

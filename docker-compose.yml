@@ -12,6 +12,7 @@ services:
   
   redis:
     image: redis:7-alpine
+    command: redis-server --requirepass redis_password
     volumes:
       - redis_data:/data
   
@@ -29,7 +30,7 @@ services:
     build: .
     environment:
       - DATABASE_URL=postgresql://postgres:password@db:5432/urlshortener
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=redis://:redis_password@redis:6379
       - HOST_URL=http://localhost
     depends_on:
       - db
