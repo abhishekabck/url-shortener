@@ -1,18 +1,23 @@
 # URL Shortener
-> URL Shortener is kind of Tool which allows users convert their long url to a small url which allows users to compromise space and using it in a places where large Url can't be used.
 
-## Features:
-> - short_urls
-> - Easy tracking of number of clicks
+> URL Shortener is a tool which allows users to convert their long URLs to small URLs, which helps save space and makes them usable in places where large URLs can't be used.
+
+## Features
+
+- Short URLs
+- Easy tracking of number of clicks
 
 ## Tech Stack
-> - `FastAPI`
-> - `Redis`
-> - `PostgreSql`
-> - `SqlAlchemy`
-> - `ORM`
 
-### File Structure
+- `FastAPI`
+- `Redis`
+- `PostgreSQL`
+- `SQLAlchemy ORM`
+- `Nginx`
+- `Docker`
+
+## File Structure
+
 ```
 url-shortener
 ├── app
@@ -22,7 +27,8 @@ url-shortener
 │   ├── models.py
 │   ├── schemas.py
 │   ├── crud.py
-│   └── cache.py
+│   ├── cache.py
+│   └── batch.py
 ├── docker-compose.yml
 ├── Dockerfile
 ├── nginx.conf
@@ -30,22 +36,84 @@ url-shortener
 ```
 
 ## Architecture
+
 ```
 User/Browser
      │
      ▼
-  Nginx          ← reverse proxy, receives all requests
+  Nginx          ← reverse proxy, receives all requests on port 80
      │
      ▼
-  FastAPI         ← your backend, handles logic
+  FastAPI         ← handles all application logic, port 8000
      │
   ┌──┴──┐
   │     │
 Redis  PostgreSQL
-(cache) (main DB)
+(source of truth) (persistent backup)
 ```
 
-## Creating a short URL
+### Click Count System
+
+```
+User clicks short URL
+        │
+        ▼
+Redis incremented atomically (INCR)
+        │
+        ▼  ← Stats always read from Redis (single source of truth)
+        │
+Every 60 seconds:
+        │
+        ▼
+Background batch reads Redis counts
+        │
+        ▼
+PostgreSQL overwritten with Redis values (persistence)
+        │
+        ▼
+On Redis restart → counts reloaded from PostgreSQL
+```
+
+### Caching Strategy
+
+```
+GET /{short_code}
+        │
+        ▼
+Redis lookup (0.1ms)
+        │
+   ┌────┴──────────────┐
+   │                   │
+Hit (99%)          Miss (1%)
+   │                   │
+Return URL        PostgreSQL lookup (5-10ms)
+                       │
+                  Cache in Redis (TTL: 1 hour)
+                       │
+                  Return URL
+```
+
+### Connection Pool
+
+```
+Incoming requests
+        │
+        ▼
+SQLAlchemy pool (pool_size=5, max_overflow=10)
+        │
+  ┌─────┴──────┐
+  │            │
+Persistent   Overflow
+(5 max)      (10 max, temporary)
+        │
+        ▼
+PostgreSQL (max 15 simultaneous connections)
+```
+
+## Request Flow
+
+### Creating a short URL
+
 ```
 POST /shorten  {"original_url": "https://google.com"}
      │
@@ -59,7 +127,8 @@ Saves to PostgreSQL: abc123 → https://google.com
 Returns: {"short_url": "http://localhost/abc123"}
 ```
 
-## Redirecting
+### Redirecting
+
 ```
 GET /abc123
      │
@@ -75,62 +144,95 @@ YES (cache hit)    NO (cache miss)
      │               │
      └──────┬─────────┘
             ▼
-     Redirect to original URL
+     Redirect to original URL (302)
 ```
-
 
 ## Prerequisites
-> - docker
 
-## How to run
-> - Move to `root` path
-> - In Cli Run:
-> - `docker-compose build`
-> - `docker-compose up`
-> - Access API at: `http://localhost:8000`
+- Docker
 
+## How to Run
 
-## API endpoints
+Move to `root` path and in CLI run:
+
+```bash
+docker-compose build
+docker-compose up
 ```
-POST   /shorten        → create short URL
-Body: {
-    "original_url": "https://google.com"
-    }
 
-Response: {
-    "short_code": "abc123",
-    "original_url": "https://google.com",
-    "short_url": "http://localhost/abck123",
-    "created_at": "2026-03-30T14:32:44"
+Access API at: `http://localhost:8000`
+
+## API Endpoints
+
+### POST /shorten
+
+```json
+Body:
+{
+  "original_url": "https://google.com"
 }
-```
-```
-GET    /{short_code}   → redirect to original
-Response code:302
-Redirects to: redirect's original url.
-```
-```
-GET    /{short_code}/stats → how many clicks
-Response: {
-    "short_code": "abc123",
-    "original_url": "https://google.com",
-    "click_count": 3,
-    "created_at": "2026-03-30T14:32:44"
+
+Response:
+{
+  "short_code": "abc123",
+  "original_url": "https://google.com",
+  "short_url": "http://localhost/abc123",
+  "created_at": "2026-03-30T14:32:44"
 }
 ```
 
-# Design Decisions
+### GET /{short_code}
 
-## Why Redis for caching
-> - **Redis** allows fast transaction of queries in comparision to database as it uses main memory for fast Execution.
-> - I used Redis because of fastExecution which prevents my database from breaking due to Continuous database connection requests and allows user fast Execution of requests.
+```
+Response code: 302
+Redirects to: original URL
+```
 
+### GET /{short_code}/stats
 
-## Why batch writing instead of writing every click to DB
-> - Batching service is kind of service which runs in given time interval.
-> - Continious updates to database breaks it thus we use redis to store user clicks and updates them to database in 1 minute of interval.
+```json
+Response:
+{
+  "short_code": "abc123",
+  "original_url": "https://google.com",
+  "click_count": 3,
+  "created_at": "2026-03-30T14:32:44"
+}
+```
 
-## Why 302 not 301 for redirects
-> `301` -> Refers to permanent shift which tell browsers to remeber that url have been shifted.
-> If `301` is used, browsers cache the redirect permanently and never hit our server again — click counting breaks entirely.
-> `302` -> Temporary Redirect.
+## Design Decisions
+
+### Why Redis for caching?
+
+- **Redis** allows fast execution of queries in comparison to a database as it uses main memory.
+- I used Redis because its fast execution prevents my database from breaking due to continuous database connection requests and allows users faster execution of requests.
+
+### Why batch writing instead of writing every click to DB?
+
+- Batching service is a service which runs at a given time interval.
+- Continuous updates to the database can overwhelm it, so we use Redis to store user clicks and update them to the database in 1 minute intervals.
+
+### Why 302 not 301 for redirects?
+
+- `301` → Permanent redirect. Tells browsers to remember that the URL has shifted permanently.
+- If `301` is used, browsers cache the redirect permanently and never hit our server again — click counting breaks entirely.
+- `302` → Temporary redirect. Ensures every request reaches our server.
+
+### How do I handle Race Conditions?
+
+Race Condition: The issue was how the previous system was failing to give correct stats for one particular condition during batch recording from Redis to PostgreSQL.
+
+**Scenario:**
+- User clicks a URL x8, with previous clicks in DB = 22
+- Total click count: 8 + 22 → 30
+- Batching starts
+- Redis → 0; DB → 22 (query not yet executed)
+- `GET /{short_code}/stats` → click count = 22 ❌ (wrong)
+- DB gets updated
+- `GET /{short_code}/stats` → click count = 30 ✅ (correct)
+
+**Solution:**
+- Using Redis as single source of truth
+- All clicks are loaded at the beginning from PostgreSQL into Redis
+- All interactions between clicks and users treat Redis as the primary database
+- Batch system updates click counts in PostgreSQL for persistence as secondary database
