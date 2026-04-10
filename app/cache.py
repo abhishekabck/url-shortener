@@ -1,56 +1,73 @@
-import redis
 import os
-from sqlalchemy import select
+import redis
+from typing import Any
+
+from redis.crc import key_slot
+
 from app.models import URL
+from app.url_exceptions import CacheKeyNotFoundException
 
 redis_client = redis.from_url(os.getenv("REDIS_URL") + "/0")
-redis_client_counts = redis.from_url(os.getenv("REDIS_URL") + "/1")
-URL_TTL = 3600
+redis_client_2 = redis.from_url(os.getenv("REDIS_URL") + "/1")
 
-## URL CHACHE PART
+get_key = lambda short_code: f"USER:{short_code}"
+dirty_set_key = "Pending:BatchQueue"
 
-def get_cached_url(short_code) -> str | None:
-    result = redis_client.get(short_code)
-    if result is None:
-        return None
-    else:
-        return result.decode("utf-8")
+def set_url_hash(short_code, data: dict[str, Any]):
+    key = get_key(short_code)
+    exist = redis_client.exists(key)
+    if exist:
+        return False
+    redis_client.hset(key, mapping=data)
+    return True
 
-def set_cached_url(short_code, original_url) -> None:
-    result = redis_client.setex(short_code, URL_TTL, original_url)
 
-def delete_cached_url(short_code):
-    redis_client.delete(short_code)
-    
+def get_url_hash(short_code: str):
+    key = get_key(short_code)
+    raw_data = redis_client.hgetall(key)
+    if not raw_data:
+        raise CacheKeyNotFoundException(key)
+    return {k.decode(): v.decode() for k,v in raw_data.items()}
 
-## COUNT CACHE PART
-def increment_cached_click_count(short_code) -> None:
-    redis_client_counts.incr(f"clicks:{short_code}")
-    
-def get_cached_click_count(short_code) -> int:
-    count = redis_client_counts.get(f"clicks:{short_code}")
-    if not count:
-        return 0
-    return int(count.decode("utf-8"))
+def get_key_from_url_hash(short_code, key1):
+    key = get_key(short_code)
+    return redis_client.hget(key, key1)
 
-def get_all_cached_click_counts() -> list[list[str, int]]:
-    counts = {}
-    keys = redis_client_counts.keys("clicks:*")
-    for key in keys:
-        short_code = key.decode("utf-8").replace("clicks:", "")
-        count = redis_client_counts.get(key)
-        if count:
-                count = int(count.decode('utf-8'))
-                counts[short_code] = count
-    
-    return counts
+def get_all_short_codes():
+    keys = redis_client.keys("USER:*")
+    short_codes = {key.decode().split(":")[1]: None for key in keys}
+    return short_codes
 
-def bulk_update(counts):
-    for key in counts:
-        redis_client_counts.incr(f"clicks:{key}", counts[key])
+def add_to_dirty_set(short_code):
+    redis_client_2.sadd(dirty_set_key, short_code)
+
+
+def increment_count_in_cache(short_code):
+    key = get_key(short_code)
+    return redis_client.hincrby(key, "click_count", 1)
+
+
+def get_chunked_data(max_chunk_size=500):
+    records = list()
+    chunked_short_codes = redis_client_2.spop(dirty_set_key, count=max_chunk_size)
+    for short_code in chunked_short_codes:
+        short_code = short_code.decode()
+        record = get_url_hash(short_code)
+        record["short_code"] = short_code
+        records.append(record)
+    return records
+
+def update_dirty_set(short_codes: list[str]):
+    redis_client_2.sadd(dirty_set_key, *short_codes)
 
 def warm_redis_from_db(db):
-    urls = db.query(URL.short_code, URL.click_count).all()
-    for short_code, click_count in urls:
-        key = f"clicks:{short_code}"
-        redis_client_counts.setnx(key, click_count)
+    records = db.query(URL).all()
+    if not records:
+        return
+    for record in records:
+        set_url_hash(record.short_code,
+                     data={
+                         "original_url": record.original_url,
+                         "click_count": str(record.click_count),
+                         "created_at": record.created_at,
+                     })

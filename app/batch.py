@@ -1,45 +1,42 @@
-from app.cache import get_all_cached_click_counts, bulk_update
-from sqlalchemy import case, update
-from app.models import URL
-from fastapi import Depends
-from app.database import SessionLocal
 import asyncio
-
-update_query = lambda counts: (
-    update(URL)
-    .where(URL.short_code.in_(counts.keys()))
-    .values(
-        click_count=case(
-            counts,
-            value=URL.short_code,
-            else_=URL.click_count  # keep existing if not in batch
-        )
-    )
-)
+from app.models import URL
+from app.database import SessionLocal
+from sqlalchemy.dialects.postgresql import insert
+from app.cache import (get_chunked_data,
+                       update_dirty_set,
+                       redis_client_2)
 
 
-def chunked_dict(d, size):
-    items = list(d.items())
-    for i in range(0, len(items), size):
-        yield dict(items[i:i+size])
-
-def update_counts_in_db(db):
-    counts = get_all_cached_click_counts()
-    if not counts:
+def update_or_insert_chunked_data_to_database(db, chunk_size=500):
+    records = get_chunked_data(max_chunk_size=chunk_size)
+    if not records:
         return
-    for chunk in chunked_dict(counts, 200):
-        try:
-            db.execute(update_query(chunk))
-            db.commit()
-        except Exception as e:
-            print(f"Batch chunk failed: {e}")
+    stmt = insert(URL).values(records)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["short_code"],
+        set_={
+            "click_count": stmt.excluded.click_count,
+            "original_url": stmt.excluded.original_url,
+        }
+    )
+    try:
+        db.execute(stmt)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        update_dirty_set([r["short_code"] for r in records])
+        print(f"Batch update failed: {e}")
 
 
-async def click_count_increment_batch():
+async def batch_sync_loop():
     while True:
         await asyncio.sleep(60)
         db = SessionLocal()
         try:
-            update_counts_in_db(db)
+            accuired = redis_client_2.set("batch_lock", "1", nx=True, ex=300)
+            if not accuired:
+                continue
+            update_or_insert_chunked_data_to_database(db)
         finally:
+            redis_client_2.delete("batch_lock")
             db.close()
