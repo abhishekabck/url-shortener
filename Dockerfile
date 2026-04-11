@@ -16,7 +16,7 @@ COPY . .
 ENV PYTHONPATH=/app/packages
 
 CMD ["python", "-m", "gunicorn", "app.main:app", \
-     "-w", "4", \
+     "-w", "9", \
      "-k", "uvicorn.workers.UvicornWorker", \
      "--bind", "0.0.0.0:8000", \
      "--timeout", "60", \

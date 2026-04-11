@@ -4,3 +4,7 @@ __pycache__/
 *.env
 .venv/
 .idea
+*.sh
+sysinfo.txt
+docs/
+url_shortener_v2_architecture.svg
