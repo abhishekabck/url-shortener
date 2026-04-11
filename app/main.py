@@ -27,20 +27,28 @@ def wait_for_db():
             time.sleep(3)
     raise Exception("Could not connect to database.")
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    wait_for_db()
-    Base.metadata.create_all(engine)
-    db = SessionLocal()
-    try:
-        warm_redis_from_db(db)
-    finally:
-        db.close()
-    task = asyncio.create_task(batch_sync_loop())
-    yield
-    task.cancel()
+    is_first_worker = not os.path.exists("/dev/shm/warmup_done")
 
+    if is_first_worker:
+        wait_for_db()
+        Base.metadata.create_all(engine, checkfirst=True)
+        db = SessionLocal()
+        try:
+            warm_redis_from_db(db)
+        finally:
+            db.close()
+        open("/dev/shm/warmup_done", "w").close()
+        task = asyncio.create_task(batch_sync_loop())
+        yield
+        task.cancel()
+        os.remove("/dev/shm/warmup_done")
+    else:
+        # Wait until first worker finishes warmup
+        while not os.path.exists("/dev/shm/warmup_done"):
+            await asyncio.sleep(0.5)
+        yield  # just serve requests, no batch
 app = FastAPI(lifespan=lifespan)
 
 
